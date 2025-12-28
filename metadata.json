@@ -1,0 +1,5 @@
+{
+  "name": "Sticky Bomb Chaos",
+  "description": "A high-energy 2D local multiplayer party game featuring a hot-potato mechanic. Players pass a ticking glue bomb back and forth on a platform arena before it explodes!",
+  "requestFramePermissions": []
+}
