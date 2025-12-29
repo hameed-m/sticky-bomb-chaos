@@ -4,8 +4,8 @@ import {
   Player, 
   PlayerState, 
   BombState, 
-  Vector2, 
-  Particle 
+  GameSettings,
+  GameStatus
 } from '../types';
 import { 
   CANVAS_WIDTH, 
@@ -25,9 +25,11 @@ import {
   BOMB_SPAWN_INTERVAL,
   EXPLOSION_DAMAGE,
   TRANSFER_COOLDOWN,
+  BOMB_STICK_DELAY,
   RESPAWN_TIME,
-  KNOCKBACK_FORCE,
-  WIN_SCORE
+  SPRITE_SIZE,
+  SPRITE_SCALE,
+  ANIM_SPEED
 } from '../constants';
 import { Play, RotateCcw } from 'lucide-react';
 
@@ -45,14 +47,49 @@ interface GameCanvasProps {
   onScoreUpdate: (p1Score: number, p2Score: number) => void;
   onTimeUpdate: (time: number) => void;
   onGameOver: (winnerId: number) => void;
+  onGameStart: () => void;
+  gameStatus: GameStatus;
+  settings: GameSettings;
+  isPaused: boolean;
 }
 
-const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, onGameOver }) => {
+const GameCanvas: React.FC<GameCanvasProps> = ({ 
+  onScoreUpdate, 
+  onTimeUpdate, 
+  onGameOver, 
+  onGameStart,
+  gameStatus,
+  settings, 
+  isPaused 
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const requestRef = useRef<number>();
+  const requestRef = useRef<number | undefined>(undefined);
   const keysPressed = useRef<{ [key: string]: boolean }>({});
   
-  // Game State Ref (Mutable for performance)
+  // Images
+  const p1Sprite = useRef<HTMLImageElement>(new Image());
+  const p2Sprite = useRef<HTMLImageElement>(new Image());
+  const [imagesLoaded, setImagesLoaded] = useState(false);
+
+  useEffect(() => {
+    let loadedCount = 0;
+    const onload = () => {
+        loadedCount++;
+        if (loadedCount >= 2) setImagesLoaded(true);
+    };
+    
+    // Changed back to .png as user likely has pngs for sprites
+    p1Sprite.current.src = "/p1_spritesheet.png";
+    p1Sprite.current.onload = onload;
+    
+    p2Sprite.current.src = "/p2_spritesheet.png";
+    p2Sprite.current.onload = onload;
+
+    // Fallback if they don't load
+    setTimeout(() => setImagesLoaded(true), 1000);
+  }, []);
+  
+  // Game State Ref
   const gameState = useRef<GameState>({
     players: [
       {
@@ -60,7 +97,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         pos: { x: 200, y: 500 },
         vel: { x: 0, y: 0 },
         size: { x: 40, y: 60 },
-        color: '#3B82F6', // Blue-500
+        color: '#3B82F6', 
         hp: 100,
         maxHp: 100,
         facingRight: true,
@@ -68,14 +105,17 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         canDoubleJump: true,
         state: PlayerState.IDLE,
         respawnTimer: 0,
-        score: 0
+        score: 0,
+        animFrame: 0,
+        animTimer: 0,
+        animRow: 0
       },
       {
         id: 2,
         pos: { x: 1000, y: 500 },
         vel: { x: 0, y: 0 },
         size: { x: 40, y: 60 },
-        color: '#EF4444', // Red-500
+        color: '#EF4444', 
         hp: 100,
         maxHp: 100,
         facingRight: false,
@@ -83,7 +123,10 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         canDoubleJump: true,
         state: PlayerState.IDLE,
         respawnTimer: 0,
-        score: 0
+        score: 0,
+        animFrame: 0,
+        animTimer: 0,
+        animRow: 0
       }
     ],
     bomb: {
@@ -95,23 +138,29 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
       ownerId: null,
       timer: 0,
       transferCooldown: 0,
-      spawnTimer: 1 // Start spawning immediately
+      stickCooldown: 0,
+      spawnTimer: 1
     },
     particles: [],
     winner: null,
     isRunning: false,
-    timeLeft: 180
+    timeLeft: settings.matchDuration
   });
 
-  const [gameStatus, setGameStatus] = useState<'START' | 'PLAYING' | 'OVER'>('START');
+  // Sync settings when they change (if not playing)
+  useEffect(() => {
+    if (gameStatus === 'START') {
+      gameState.current.timeLeft = settings.matchDuration;
+      onTimeUpdate(settings.matchDuration);
+    }
+  }, [settings, gameStatus, onTimeUpdate]);
 
   // --- Input Handling ---
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       keysPressed.current[e.code] = true;
       
-      // Jump Logic (Event driven for precision)
-      if (!gameState.current.isRunning) return;
+      if (!gameState.current.isRunning || isPaused) return;
 
       // P1 Jump
       if (e.code === 'KeyW') {
@@ -163,17 +212,18 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, []);
+  }, [isPaused]);
 
   const throwBomb = (player: Player) => {
     const state = gameState.current;
     state.bomb.state = BombState.THROWN;
-    state.bomb.ownerId = null; // No one holds it in air
-    // Throw velocity
+    state.bomb.ownerId = null;
     state.bomb.vel.x = player.facingRight ? 15 : -15;
     state.bomb.vel.y = -5;
     state.bomb.pos.x = player.pos.x + (player.size.x / 2);
     state.bomb.pos.y = player.pos.y;
+    // Add delay so it doesn't instantly stick to the thrower
+    state.bomb.stickCooldown = BOMB_STICK_DELAY; 
   };
 
   const spawnParticles = (x: number, y: number, color: string, count: number) => {
@@ -192,8 +242,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
   const resetGame = () => {
     gameState.current = {
         players: [
-          { ...gameState.current.players[0], pos: { x: 200, y: 500 }, hp: 100, score: 0, state: PlayerState.IDLE, vel: {x:0, y:0}, respawnTimer: 0 },
-          { ...gameState.current.players[1], pos: { x: 1000, y: 500 }, hp: 100, score: 0, state: PlayerState.IDLE, vel: {x:0, y:0}, respawnTimer: 0 }
+          { ...gameState.current.players[0], pos: { x: 200, y: 500 }, hp: 100, score: 0, state: PlayerState.IDLE, vel: {x:0, y:0}, respawnTimer: 0, animFrame: 0, animTimer: 0 },
+          { ...gameState.current.players[1], pos: { x: 1000, y: 500 }, hp: 100, score: 0, state: PlayerState.IDLE, vel: {x:0, y:0}, respawnTimer: 0, animFrame: 0, animTimer: 0 }
         ],
         bomb: {
           active: false,
@@ -204,37 +254,55 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
           ownerId: null,
           timer: 0,
           transferCooldown: 0,
+          stickCooldown: 0,
           spawnTimer: 1
         },
         particles: [],
         winner: null,
         isRunning: true,
-        timeLeft: 180
+        timeLeft: settings.matchDuration
       };
-      setGameStatus('PLAYING');
+      
       onScoreUpdate(0, 0);
-      onTimeUpdate(180);
+      onTimeUpdate(settings.matchDuration);
+      onGameStart();
+  };
+
+  const updateAnimation = (p: Player) => {
+    let targetRow = 0;
+    if (p.state === PlayerState.RUNNING) targetRow = 1;
+    else if (p.state === PlayerState.JUMPING || p.state === PlayerState.FALLING) targetRow = 2;
+
+    if (p.animRow !== targetRow) {
+        p.animRow = targetRow;
+        p.animFrame = 0;
+    }
+
+    p.animTimer += 1/FPS;
+    if (p.animTimer >= ANIM_SPEED) {
+        p.animTimer = 0;
+        p.animFrame++;
+        if (p.animFrame >= 6) p.animFrame = 0;
+    }
   };
 
   // --- Main Loop ---
   const update = () => {
     const state = gameState.current;
 
-    if (!state.isRunning) return;
+    if (!state.isRunning || isPaused) return;
 
     // 1. Timer Logic
     state.timeLeft -= 1 / FPS;
     if (state.timeLeft <= 0) {
         state.timeLeft = 0;
-        // Time Over Win Condition
         if (state.players[0].score > state.players[1].score) state.winner = 1;
         else if (state.players[1].score > state.players[0].score) state.winner = 2;
-        else state.winner = 0; // Draw (handled as 0)
+        else state.winner = 0;
         state.isRunning = false;
-        setGameStatus('OVER');
+        // setGameStatus('OVER'); // Handled by callback
         onGameOver(state.winner);
     }
-    // Only update React UI every second (approx) to save renders
     if (Math.floor(state.timeLeft) % 1 === 0) {
         onTimeUpdate(Math.ceil(state.timeLeft));
     }
@@ -247,17 +315,17 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
           p.state = PlayerState.DEAD;
           p.respawnTimer -= 1/FPS;
           if (p.respawnTimer <= 0) {
-              // Respawn
               p.hp = 100;
-              p.pos = { x: CANVAS_WIDTH / 2 - p.size.x / 2, y: 150 }; // Drop from sky center
+              p.pos = { x: CANVAS_WIDTH / 2 - p.size.x / 2, y: 150 };
               p.vel = { x: 0, y: 0 };
               p.state = PlayerState.IDLE;
               spawnParticles(p.pos.x, p.pos.y, '#FFFFFF', 20);
           }
-          return; // Skip physics if dead
+          return;
       }
 
       // Input Movement
+      let isDropping = false;
       if (p.id === 1) {
         if (keysPressed.current['KeyA']) {
             p.vel.x -= MOVE_SPEED;
@@ -267,7 +335,10 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
             p.vel.x += MOVE_SPEED;
             p.facingRight = true;
         }
-        if (keysPressed.current['KeyS']) p.vel.y += FAST_FALL_SPEED;
+        if (keysPressed.current['KeyS']) {
+            p.vel.y += FAST_FALL_SPEED;
+            isDropping = true;
+        }
       } else {
         if (keysPressed.current['ArrowLeft']) {
             p.vel.x -= MOVE_SPEED;
@@ -277,43 +348,40 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
             p.vel.x += MOVE_SPEED;
             p.facingRight = true;
         }
-        if (keysPressed.current['ArrowDown']) p.vel.y += FAST_FALL_SPEED;
+        if (keysPressed.current['ArrowDown']) {
+             p.vel.y += FAST_FALL_SPEED;
+             isDropping = true;
+        }
       }
 
       // Apply Physics
       p.vel.x *= FRICTION;
       p.vel.y += GRAVITY;
       
-      // Clamp Velocity
       if (p.vel.x > MAX_SPEED) p.vel.x = MAX_SPEED;
       if (p.vel.x < -MAX_SPEED) p.vel.x = -MAX_SPEED;
 
-      // Move X
       p.pos.x += p.vel.x;
 
-      // Bounds Collision X
       if (p.pos.x < BOUNDS.left) { p.pos.x = BOUNDS.left; p.vel.x = 0; }
       if (p.pos.x + p.size.x > BOUNDS.right) { p.pos.x = BOUNDS.right - p.size.x; p.vel.x = 0; }
 
-      // Platform Collision X (Basic check to prevent sticking to walls)
-      // Omitted for simplicity in this 2D jam context, relying on Y collision mostly.
-
-      // Move Y
       p.pos.y += p.vel.y;
 
-      // Bounds Collision Y
       if (p.pos.y < BOUNDS.top) { p.pos.y = BOUNDS.top; p.vel.y = 0; }
       if (p.pos.y + p.size.y > BOUNDS.bottom) { p.pos.y = BOUNDS.bottom - p.size.y; p.vel.y = 0; p.isGrounded = true; } 
 
       // Platform Collision Y
-      p.isGrounded = false; // Assume air first
+      p.isGrounded = false;
       for (const plat of PLATFORMS) {
-        // Only collide if falling downwards and above the platform
+        // Drop through logic: If it's a floating platform and we are holding down, ignore collision
+        if (plat.type === 'platform' && isDropping) continue;
+
         if (
-            p.vel.y >= 0 && // Falling
-            p.pos.y + p.size.y - p.vel.y <= plat.y && // Was above last frame (roughly)
-            p.pos.y + p.size.y >= plat.y && // Is intersecting now
-            p.pos.x + p.size.x > plat.x && // Within X bounds
+            p.vel.y >= 0 && 
+            p.pos.y + p.size.y - p.vel.y <= plat.y && 
+            p.pos.y + p.size.y >= plat.y && 
+            p.pos.x + p.size.x > plat.x && 
             p.pos.x < plat.x + plat.w
         ) {
             p.pos.y = plat.y - p.size.y;
@@ -323,14 +391,18 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         }
       }
 
-      // Update State String
+      // Update State
       if (Math.abs(p.vel.x) > 0.5) p.state = PlayerState.RUNNING;
       else p.state = PlayerState.IDLE;
-      if (!p.isGrounded) p.state = PlayerState.JUMPING;
+      if (!p.isGrounded) p.state = p.vel.y > 0 ? PlayerState.FALLING : PlayerState.JUMPING;
+
+      // Update Animation
+      updateAnimation(p);
     });
 
     // 3. Bomb Logic
     const bomb = state.bomb;
+    if (bomb.stickCooldown > 0) bomb.stickCooldown -= 1/FPS;
     
     // Spawning
     if (bomb.state === BombState.SPAWNING) {
@@ -339,75 +411,93 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
             const node = SPAWN_NODES[Math.floor(Math.random() * SPAWN_NODES.length)];
             bomb.pos = { ...node };
             bomb.active = true;
-            bomb.state = BombState.SPAWNING; // Still waiting for pickup, but visible
-            bomb.spawnTimer = BOMB_SPAWN_INTERVAL; // Reset for NEXT cycle after this one is gone
+            bomb.state = BombState.SPAWNING;
+            bomb.spawnTimer = BOMB_SPAWN_INTERVAL;
         }
     }
 
-    // Pickup (If visible and not held/stuck)
+    // Pickup
     if (bomb.active && bomb.state === BombState.SPAWNING) {
         state.players.forEach(p => {
             if (p.hp > 0 && checkRectCollision({ x: bomb.pos.x, y: bomb.pos.y, w: bomb.radius*2, h: bomb.radius*2 }, {x: p.pos.x, y: p.pos.y, w: p.size.x, h: p.size.y})) {
                 bomb.state = BombState.HELD;
                 bomb.ownerId = p.id;
-                // Init Timer on first pickup
                 bomb.timer = BOMB_FUSE_TIME;
             }
         });
     }
 
-    // Held Logic
+    // Held
     if (bomb.state === BombState.HELD && bomb.ownerId) {
         const owner = state.players.find(p => p.id === bomb.ownerId);
         if (owner && owner.hp > 0) {
             bomb.pos.x = owner.pos.x + (owner.size.x / 2);
             bomb.pos.y = owner.pos.y - 10;
         } else {
-            // Owner died while holding? Drop it? Or explode? Let's reset.
             bomb.active = false;
             bomb.state = BombState.SPAWNING;
             bomb.ownerId = null;
         }
     }
 
-    // Thrown Logic
+    // Thrown
     if (bomb.state === BombState.THROWN) {
         bomb.vel.y += GRAVITY;
         bomb.pos.x += bomb.vel.x;
         bomb.pos.y += bomb.vel.y;
 
-        // Bounce Bounds
+        // Bounce Bounds (X)
         if (bomb.pos.x < BOUNDS.left || bomb.pos.x > BOUNDS.right) bomb.vel.x *= -0.8;
+        
+        // --- NEW LOGIC: Despawn if hits ground ---
+        let hitGround = false;
         if (bomb.pos.y > BOUNDS.bottom) {
-             bomb.pos.y = BOUNDS.bottom;
-             bomb.vel.y *= -0.6;
-             bomb.vel.x *= 0.9; // Ground friction
+          hitGround = true;
+        } else {
+            // Check collision with ground platforms
+            for (const plat of PLATFORMS) {
+                if (plat.type === 'ground' && 
+                    checkRectCollision(
+                        {x: bomb.pos.x, y: bomb.pos.y, w: bomb.radius*2, h: bomb.radius*2}, 
+                        {x: plat.x, y: plat.y, w: plat.w, h: plat.h}
+                    )) {
+                    hitGround = true;
+                    break;
+                }
+            }
         }
 
-        // Stick Collision
-        state.players.forEach(p => {
-            if (p.hp > 0 && checkRectCollision({ x: bomb.pos.x - bomb.radius, y: bomb.pos.y - bomb.radius, w: bomb.radius*2, h: bomb.radius*2 }, {x: p.pos.x, y: p.pos.y, w: p.size.x, h: p.size.y})) {
-                bomb.state = BombState.STUCK;
-                bomb.ownerId = p.id;
-                bomb.transferCooldown = 0.5; // Brief cooldown so you don't instantly stick it back to yourself if threw close
-            }
-        });
+        if (hitGround) {
+            // Poof effect
+            spawnParticles(bomb.pos.x, bomb.pos.y, '#9CA3AF', 10);
+            bomb.active = false;
+            bomb.state = BombState.SPAWNING;
+            bomb.ownerId = null;
+            bomb.spawnTimer = BOMB_SPAWN_INTERVAL;
+        }
+
+        // Stick Collision - Only if cooldown is done
+        if (bomb.stickCooldown <= 0 && !hitGround) {
+            state.players.forEach(p => {
+                if (p.hp > 0 && checkRectCollision({ x: bomb.pos.x - bomb.radius, y: bomb.pos.y - bomb.radius, w: bomb.radius*2, h: bomb.radius*2 }, {x: p.pos.x, y: p.pos.y, w: p.size.x, h: p.size.y})) {
+                    bomb.state = BombState.STUCK;
+                    bomb.ownerId = p.id;
+                    bomb.transferCooldown = 0.5;
+                }
+            });
+        }
     }
 
-    // Stuck Logic (The Hot Potato)
+    // Stuck
     if (bomb.state === BombState.STUCK && bomb.ownerId) {
         const victim = state.players.find(p => p.id === bomb.ownerId);
         
         if (victim && victim.hp > 0) {
-             // Follow Victim
              bomb.pos.x = victim.pos.x + (victim.size.x / 2);
              bomb.pos.y = victim.pos.y + (victim.size.y / 2);
-
-             // Countdown
              bomb.timer -= 1/FPS;
              bomb.transferCooldown -= 1/FPS;
 
-             // Transfer Logic
              if (bomb.transferCooldown <= 0) {
                  const other = state.players.find(p => p.id !== bomb.ownerId);
                  if (other && other.hp > 0) {
@@ -415,10 +505,8 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
                          {x: victim.pos.x, y: victim.pos.y, w: victim.size.x, h: victim.size.y},
                          {x: other.pos.x, y: other.pos.y, w: other.size.x, h: other.size.y}
                      )) {
-                         // SWAP!
                          bomb.ownerId = other.id;
                          bomb.transferCooldown = TRANSFER_COOLDOWN;
-                         // Juice: Push them apart slightly
                          const dir = victim.pos.x < other.pos.x ? -1 : 1;
                          victim.vel.x = dir * 10;
                          other.vel.x = -dir * 10;
@@ -426,41 +514,32 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
                  }
              }
 
-             // EXPLOSION
              if (bomb.timer <= 0) {
                  bomb.state = BombState.EXPLODING;
-                 // Damage
                  victim.hp -= EXPLOSION_DAMAGE;
-                 // Knockback
                  victim.vel.y = -10;
-                 // FX
                  spawnParticles(bomb.pos.x, bomb.pos.y, '#FFA500', 50);
                  
-                 // Check Death
                  if (victim.hp <= 0) {
                      const killer = state.players.find(p => p.id !== bomb.ownerId);
                      if (killer) {
                          killer.score += 1;
                          onScoreUpdate(state.players[0].score, state.players[1].score);
-                         // Win Check
-                         if (killer.score >= WIN_SCORE) {
+                         if (killer.score >= settings.winScore) {
                              state.winner = killer.id;
                              state.isRunning = false;
-                             setGameStatus('OVER');
+                             // setGameStatus('OVER'); // Handled by callback
                              onGameOver(killer.id);
                          }
                      }
                      victim.respawnTimer = RESPAWN_TIME;
                  }
-
-                 // Reset Bomb
                  bomb.active = false;
                  bomb.state = BombState.SPAWNING;
                  bomb.ownerId = null;
                  bomb.spawnTimer = BOMB_SPAWN_INTERVAL;
              }
         } else {
-             // Victim died before explosion? Reset.
              bomb.active = false;
              bomb.state = BombState.SPAWNING;
              bomb.ownerId = null;
@@ -475,7 +554,6 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         p.pos.y += p.vel.y;
         if (p.life <= 0) state.particles.splice(i, 1);
     }
-
   };
 
   // --- Rendering ---
@@ -483,16 +561,19 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
     // Clear
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
     
-    // Background (Subtle Grid)
-    ctx.strokeStyle = '#1F2937';
+    // Background
+    ctx.fillStyle = '#0f172a'; // Slate-900
+    ctx.fillRect(0,0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    // Grid (Subtle)
+    ctx.strokeStyle = '#1e293b'; // Slate-800
     ctx.lineWidth = 1;
     for(let x=0; x<CANVAS_WIDTH; x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x, CANVAS_HEIGHT); ctx.stroke(); }
     for(let y=0; y<CANVAS_HEIGHT; y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CANVAS_WIDTH, y); ctx.stroke(); }
 
     // Spawn Nodes
     if (gameState.current.bomb.state === BombState.SPAWNING && !gameState.current.bomb.active) {
-         // Show where nodes are vaguely
-         ctx.fillStyle = '#374151';
+         ctx.fillStyle = '#334155';
          SPAWN_NODES.forEach(node => {
              ctx.beginPath();
              ctx.arc(node.x, node.y, 5, 0, Math.PI * 2);
@@ -502,20 +583,17 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
 
     // Platforms
     PLATFORMS.forEach(plat => {
-        // Shadow
-        ctx.fillStyle = '#00000040';
+        ctx.fillStyle = '#00000060'; // Shadow
         ctx.fillRect(plat.x + 5, plat.y + 5, plat.w, plat.h);
-        // Body
-        ctx.fillStyle = plat.type === 'ground' ? '#4B5563' : '#6B7280';
+        ctx.fillStyle = plat.type === 'ground' ? '#334155' : '#475569'; // Slate-700/600
         ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
-        // Highlight
-        ctx.fillStyle = '#9CA3AF';
+        ctx.fillStyle = '#64748b'; // Slate-500
         ctx.fillRect(plat.x, plat.y, plat.w, 4);
     });
 
     // Players
     gameState.current.players.forEach(p => {
-        if (p.hp <= 0) return; // Don't draw if dead
+        if (p.hp <= 0) return;
 
         ctx.save();
         
@@ -532,27 +610,52 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
              ctx.globalAlpha = 1.0;
         }
 
-        // Body
-        ctx.fillStyle = p.color;
-        // Simple Squash/Stretch based on Y velocity
-        const stretch = Math.abs(p.vel.y) * 0.5;
-        ctx.fillRect(p.pos.x + (p.facingRight ? 0 : 0), p.pos.y - stretch, p.size.x, p.size.y + stretch);
-        
-        // Eyes (Direction)
-        ctx.fillStyle = 'white';
-        const eyeX = p.facingRight ? p.pos.x + 25 : p.pos.x + 5;
-        ctx.fillRect(eyeX, p.pos.y + 10, 10, 10);
-        ctx.fillStyle = 'black';
-        ctx.fillRect(eyeX + (p.facingRight ? 4 : 2), p.pos.y + 12, 4, 4);
+        // Draw Sprite
+        const img = p.id === 1 ? p1Sprite.current : p2Sprite.current;
+        if (imagesLoaded && img.complete && img.naturalWidth !== 0) {
+            // Sprite Logic
+            // p.size is the hit box (40x60). Sprite might be 32x32 scaled 2.5x -> 80x80.
+            // We need to center the sprite on the hitbox.
+            const spriteW = SPRITE_SIZE * SPRITE_SCALE;
+            const spriteH = SPRITE_SIZE * SPRITE_SCALE;
+            const drawX = p.pos.x + p.size.x/2 - spriteW/2;
+            const drawY = p.pos.y + p.size.y - spriteH; // Anchor at feet
 
-        // Health Bar above player
+            // Flip if needed
+            if (!p.facingRight) {
+                ctx.translate(drawX + spriteW, drawY);
+                ctx.scale(-1, 1);
+                ctx.drawImage(
+                    img,
+                    p.animFrame * SPRITE_SIZE, p.animRow * SPRITE_SIZE, SPRITE_SIZE, SPRITE_SIZE,
+                    0, 0, spriteW, spriteH
+                );
+            } else {
+                ctx.drawImage(
+                    img,
+                    p.animFrame * SPRITE_SIZE, p.animRow * SPRITE_SIZE, SPRITE_SIZE, SPRITE_SIZE,
+                    drawX, drawY, spriteW, spriteH
+                );
+            }
+        } else {
+            // Fallback Rect
+            ctx.fillStyle = p.color;
+            ctx.fillRect(p.pos.x, p.pos.y, p.size.x, p.size.y);
+            // Eyes
+            ctx.fillStyle = 'white';
+            const eyeX = p.facingRight ? p.pos.x + 25 : p.pos.x + 5;
+            ctx.fillRect(eyeX, p.pos.y + 10, 10, 10);
+            ctx.fillStyle = 'black';
+            ctx.fillRect(eyeX + (p.facingRight ? 4 : 2), p.pos.y + 12, 4, 4);
+        }
+
+        // Health Bar
+        ctx.restore(); // Restore context first (handle flipping)
         const hpPct = p.hp / p.maxHp;
-        ctx.fillStyle = '#1F2937';
+        ctx.fillStyle = '#1e293b';
         ctx.fillRect(p.pos.x - 5, p.pos.y - 25, p.size.x + 10, 8);
         ctx.fillStyle = hpPct > 0.5 ? '#10B981' : hpPct > 0.2 ? '#FBBF24' : '#EF4444';
         ctx.fillRect(p.pos.x - 4, p.pos.y - 24, (p.size.x + 8) * hpPct, 6);
-
-        ctx.restore();
     });
 
     // Bomb
@@ -561,37 +664,39 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         ctx.save();
         ctx.translate(bomb.pos.x, bomb.pos.y);
         
-        // Pulse if Stuck
         let scale = 1;
         if (bomb.state === BombState.STUCK) {
             scale = 1 + Math.sin(Date.now() / 100) * 0.2;
-            
-            // Draw Timer text
             ctx.fillStyle = 'white';
             ctx.font = 'bold 20px Arial';
             ctx.textAlign = 'center';
             ctx.fillText(bomb.timer.toFixed(1), 0, -30);
         }
-
         ctx.scale(scale, scale);
 
-        // Bomb Body
-        ctx.fillStyle = '#1F2937'; // Black/Grey
+        // Make Bomb lighter and high contrast
+        ctx.fillStyle = '#facc15'; // Yellow-400
         ctx.beginPath();
         ctx.arc(0, 0, bomb.radius, 0, Math.PI * 2);
         ctx.fill();
+        
+        // Bomb detail
+        ctx.fillStyle = '#ca8a04'; 
+        ctx.beginPath();
+        ctx.arc(0,0, bomb.radius - 3, 0, Math.PI * 2);
+        ctx.stroke();
 
         // Fuse
         ctx.beginPath();
         ctx.moveTo(0, -bomb.radius);
         ctx.quadraticCurveTo(5, -bomb.radius - 10, 10, -bomb.radius - 5);
-        ctx.strokeStyle = '#D97706';
+        ctx.strokeStyle = '#fb923c'; // Orange
         ctx.lineWidth = 2;
         ctx.stroke();
 
         // Spark
         if (bomb.state === BombState.STUCK || bomb.state === BombState.HELD) {
-            ctx.fillStyle = '#EF4444';
+            ctx.fillStyle = '#ef4444';
             ctx.beginPath();
             ctx.arc(10, -bomb.radius - 5, 3 + Math.random()*2, 0, Math.PI * 2);
             ctx.fill();
@@ -624,7 +729,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
     return () => {
         if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
-  }, []);
+  }, [isPaused, settings]);
 
   return (
     <div className="relative w-full h-full flex justify-center items-center bg-gray-900">
@@ -632,7 +737,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
         ref={canvasRef}
         width={CANVAS_WIDTH}
         height={CANVAS_HEIGHT}
-        className="border-4 border-gray-700 rounded-lg shadow-2xl bg-gray-800"
+        className="border-4 border-slate-700 rounded-lg shadow-2xl bg-slate-800"
         style={{ maxWidth: '100%', maxHeight: '100%' }}
       />
       
@@ -642,12 +747,12 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
             {gameStatus === 'START' ? (
                 <div className="text-center">
                     <h1 className="text-6xl font-arcade mb-8 text-yellow-400 drop-shadow-lg">Sticky Bomb Chaos</h1>
-                    <div className="grid grid-cols-2 gap-8 mb-8 text-left bg-gray-800 p-6 rounded-lg border border-gray-600">
+                    <div className="grid grid-cols-2 gap-8 mb-8 text-left bg-slate-800 p-6 rounded-lg border border-slate-600">
                         <div>
                             <h3 className="text-blue-400 font-bold mb-2 text-xl">PLAYER 1 (Blue)</h3>
                             <ul className="space-y-1 text-gray-300">
                                 <li><span className="font-bold text-white">WASD</span> to Move/Jump</li>
-                                <li><span className="font-bold text-white">S</span> to Fast Fall</li>
+                                <li><span className="font-bold text-white">S</span> to Fast Fall / Drop</li>
                                 <li><span className="font-bold text-white">G</span> to Throw Bomb</li>
                             </ul>
                         </div>
@@ -655,7 +760,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
                             <h3 className="text-red-400 font-bold mb-2 text-xl">PLAYER 2 (Red)</h3>
                             <ul className="space-y-1 text-gray-300">
                                 <li><span className="font-bold text-white">Arrows</span> to Move/Jump</li>
-                                <li><span className="font-bold text-white">Down</span> to Fast Fall</li>
+                                <li><span className="font-bold text-white">Down</span> to Fast Fall / Drop</li>
                                 <li><span className="font-bold text-white">L</span> to Throw Bomb</li>
                             </ul>
                         </div>
@@ -666,6 +771,7 @@ const GameCanvas: React.FC<GameCanvasProps> = ({ onScoreUpdate, onTimeUpdate, on
                     >
                         <Play size={24} /> START MATCH
                     </button>
+                    <p className="mt-4 text-xs text-gray-500">Ensure p1_spritesheet.png and p2_spritesheet.png are in your public folder.</p>
                 </div>
             ) : (
                 <div className="text-center">
